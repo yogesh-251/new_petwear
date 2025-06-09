@@ -1,0 +1,638 @@
+#########################################################################################################################
+# Script Description : Glue code for extracting Ariba Events sustainability questions from API.
+# Auth: Shayan Kabasi
+#
+#
+# High Level Execution Workflow:-
+#       1. Extract the question ids from the 1st API and store the same 
+#       2. Fetch the response of the ids identified in the step 1
+#       3. Flatten the response and save it to S3 bucket 
+#
+#
+# =========================
+# Change History
+# =========================
+# Date        Author    		Description                 Jira
+# --    -------   	  ----------  	----------------------- ----------------------
+# 0.1    14/01/2025 Shayan Kabasi	New script created      DACF-7894
+##
+###################################################################################################
+import io
+import os
+import requests
+import json
+import logging as log
+import boto3
+from redshift_module import pygresql_redshift_common as rs_common
+from lib.common.logger import get_logger
+from lib.common.utils import get_environment
+from lib.aws_utils.glue_utils import get_job_parameter
+from botocore.exceptions import ClientError
+from lib.aws_utils.secrets_manager_client import SecretsManagerClient
+import time
+from datetime import datetime, timedelta
+import calendar
+
+# Declare the list of master list of questions, this is the list of Sustainable questions for Ariba Suppliers
+master_question = {
+    "1": "Do you have a sustainability strategy and/or public commitments?",
+    "2": "Please provide details",
+    "3": "Do you have an Ecovadis score? https://ecovadis.com/",
+    "4": "Please enter your overall score",
+    "5": "Please enter the year when the Ecovadis assessment was completed",
+    "6": "Please provide your EVID number",
+    "7": "Will you be willing to complete an EcoVadis assessment within the next year? More information on EcoVadis can be found at https://ecovadis.com/ . Please note that the supplier will need to bear its EcoVadis subscription fees (https://ecovadis.com/plans-pricing/)",
+    "8": "Does your organisation calculate its carbon footprint?",
+    "9": "Please enter your organization's scope 1 emissions for the last reporting year (in metric tones of CO2)",
+    "10": "Please enter your organization's scope 2 emissions (market-based preferred) for the last reporting year (in metric tones of CO2)",
+    "11": "Please enter your organization's scope 3 emissions for the last reporting year (in metric tones of CO2)",
+    "12": "Please enter your organisation's financial revenues for the last reporting year (in USD equivalent)",
+    "13": "Does your organisation have a carbon reduction target?",
+    "14": "Is your carbon reduction target SBTi 1.5ºC?",
+    "15": "Please provide details of the key sustainability actions that your organisation is undertaking",
+    "16": "Could you please provide contact details of the person responsible for sustainability within your organisation? (Name, surname, email and phone number)"
+}
+
+# Declare the list of master questions flag
+sustainability_q1_flag = 'N'
+sustainability_q2_flag = 'N'
+sustainability_q3_flag = 'N'
+sustainability_q4_flag = 'N'
+sustainability_q5_flag = 'N'
+sustainability_q6_flag = 'N'
+sustainability_q7_flag = 'N'
+sustainability_q8_flag = 'N'
+sustainability_q9_flag = 'N'
+sustainability_q10_flag = 'N'
+sustainability_q11_flag = 'N'
+sustainability_q12_flag = 'N'
+sustainability_q13_flag = 'N'
+sustainability_q14_flag = 'N'
+sustainability_q15_flag = 'N'
+sustainability_q16_flag = 'N'
+
+
+class api_auth_failure(Exception):
+    """A specific error"""
+    pass
+
+
+class invalid_input(Exception):
+    """A specific error"""
+    pass
+
+
+class api_response_400(Exception):
+    """A specific error"""
+    pass
+
+
+def query_redshift_event_ids(start_date, end_date):
+    try:
+        event_list = []
+
+        # SQL query to fetch event_id from the specified table
+        select_query = f"select distinct event_id from public.mio226_t_projects_fact  where  record_type = 'sourcing_project_event' and event_type_description in ('RFI', 'RFP', 'RFQ') and created_date between '{start_date}' and '{end_date}' "
+
+        log.info('execute_select_query : started')
+        log.info('executing : {}'.format(select_query))
+
+        connection = rs_common.get_connection(env)
+        cursor = connection.cursor()
+        cursor.execute(select_query)
+        results = cursor.fetchall()
+
+        log.info("Fetched : {} rows".format(len(results)))
+
+        # Print the results
+        print(f"Event IDs from table mio226_t_projects_fact:")
+        for row in results:
+            event_list.append(row[0])
+            print(row[0])
+
+        return event_list
+
+    except Exception as error:
+        print("Error while connecting to Redshift:", error)
+
+    finally:
+        # Close the cursor and connection
+        if connection:
+            cursor.close()
+            connection.close()
+            print("Redshift connection is closed")
+
+
+def get_auth_token(authorization):
+    """
+    get access token for accessing differnt apis under analytical reporting
+    :return: access token
+    """
+    #base64 = "ZGE1YzU4ZDctMzQ0Zi00ZThkLTk1OTMtZmU3MTg0NDFhMGQwOlpLaWZhbERaUzNpQ0t6NnJnNGdoYWY5b1h6dUN5TnBS"
+    base64 = authorization
+    url = "https://api-eu.ariba.com/v2/oauth/token?grant_type=openapi_2lo"
+
+    payload = {}
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': 'Basic' + ' ' + base64
+    }
+    try:
+        response = requests.request(
+            "POST", url, headers=headers, data=payload)
+        if response.status_code == 200:
+            access_token = dict(response.json())['access_token']
+            return access_token
+        else:
+            raise api_auth_failure(
+                f"get auth token failed with response code {str(response.status_code)} and response is {str(response.json())}")
+    except api_auth_failure as e:
+        log.error(
+            f'Received error when calling get auth token for ariba API : {str(e)}')
+        raise e
+
+
+def get_headers():
+    """
+    get header payload with access token and api key
+    :return: header dict {'Content-Type','Authorization','apiKey'}
+    """
+    #Define the secret 
+    sm_client = SecretsManagerClient(env=env)
+    secret = sm_client.get_credentials(get_job_parameter('secret_name'))
+    apikey = secret['apikey']
+    authorization = secret['Authorization']
+
+    refresh_token = get_auth_token(authorization)
+    #apikey = "3uh2ge5H9CIPnSp9yTNSYxAJTVD1erY8"
+    return {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer' + ' ' + refresh_token,
+        'apiKey': apikey
+    }
+
+
+def generate_ariba_response_item(event_list):
+    """"
+    Generate the Ariba item reponse, need to pass event id as input
+    """
+    realm = 'syngenta'
+    # document_list = ['Doc2240568047', 'Doc2205943093', 'Doc2112471559', 'Doc2240568047', 'Doc2234150698']
+    document_list = event_list
+    headers = get_headers()
+    all_responses = []
+    # Counter variables to control the API rate limit
+    loop_counter = 1
+    check_value = 30
+
+    for internal_id in document_list:
+        try:
+            # Wait for 30 sections after each call
+            print(
+                f"API call is happening for counter, internalId, check_value - {loop_counter}, {internal_id}, {check_value}")
+            url = f"https://eu.openapi.ariba.com/api/sourcing-approval/v2/prod/RFXDocument/{internal_id}?realm={realm}&$select=items"
+            response = requests.get(url, headers=headers)
+            # print("Going to sleep for 5 seconds")
+            # time.sleep(5)
+
+            response_data = response.json()
+            log.info(response_data)
+            if response.status_code == 200:
+                log.info(
+                    f"Response received for Ariba item for internal id {internal_id}")
+                if response_data:
+                    all_responses.append(response_data)
+            else:
+                raise api_response_400(
+                    f"Error code 400 received for item response for internal id {internal_id}")
+            if loop_counter == check_value:
+                print(
+                    f"Going to sleep for 30 seconds as the counter value is {loop_counter} and check value is {check_value}")
+                time.sleep(30)
+                check_value = check_value + 30
+                # Refreshing the token after 30th iteration
+                headers = get_headers()
+
+            loop_counter = loop_counter + 1
+
+        except api_response_400 as e:
+            log.error(
+                f'Received error when calling ariba API : {str(e)}')
+            raise e
+    return all_responses
+
+
+def get_month_end_date(month, year):
+    """
+        this function accepts month and year.
+        :return: month_end_date
+    """
+    try:
+        last_day = calendar.monthrange(year, month)[1]
+        return f"{year}-{month:02}-{last_day}"
+    except invalid_input as e:
+        log.error(f'Received error for get month end date : {str(e)}')
+        raise e
+
+
+def get_current_month_end_date():
+    try:
+        curr_dt = datetime.today()
+        res = calendar.monthrange(curr_dt.year, curr_dt.month)[1]
+        cm_end_date = datetime(curr_dt.year, curr_dt.month, res).strftime('%Y-%m-%d')
+        return cm_end_date
+    except invalid_input as e:
+        log.error(f'Received error for get current month end date : {str(e)}')
+        raise e
+
+
+def process_json(data):
+    global sustainability_q1_flag, sustainability_q1_item, sustainability_q2_flag, sustainability_q2_item, sustainability_q3_flag, sustainability_q3_item, sustainability_q4_flag, sustainability_q4_item, sustainability_q5_flag, sustainability_q5_item, sustainability_q6_flag, sustainability_q7_flag, sustainability_q6_item, sustainability_q8_flag, sustainability_q7_item, sustainability_q8_item, sustainability_q9_flag, sustainability_q9_item, sustainability_q10_flag, sustainability_q10_item, sustainability_q11_flag, sustainability_q11_item, sustainability_q12_flag, sustainability_q12_item, sustainability_q13_flag, sustainability_q13_item, sustainability_q14_flag, sustainability_q14_item, sustainability_q15_flag, sustainability_q15_item, sustainability_q16_flag, sustainability_q16_item, internal_id
+    results = []
+    for document in data:
+        try:
+            internal_id = document['internalId']
+            sustainability_item = next((item for item in document['items'] if item['title'] == 'Sustainability'), None)
+
+            if sustainability_item:
+                parent_item_id = sustainability_item['itemId']
+                child_items = [item for item in document['items'] if item.get('parentItem') == parent_item_id]
+
+                flags = []
+                for item in child_items:
+                    # flag = 'Y' if item['title'] else 'N'
+                    # flags.append(flag)
+                    if item['title'] == master_question["1"]:
+                        sustainability_q1_flag = 'Y'
+                        sustainability_q1_item = item['itemId']
+                    elif item['title'] == master_question["2"]:
+                        sustainability_q2_flag = 'Y'
+                        sustainability_q2_item = item['itemId']
+                    elif item['title'] == master_question["3"]:
+                        sustainability_q3_flag = 'Y'
+                        sustainability_q3_item = item['itemId']
+                    elif item['title'] == master_question["4"]:
+                        sustainability_q4_flag = 'Y'
+                        sustainability_q4_item = item['itemId']
+                    elif item['title'] == master_question["5"]:
+                        sustainability_q5_flag = 'Y'
+                        sustainability_q5_item = item['itemId']
+                    elif item['title'] == master_question["6"]:
+                        sustainability_q6_flag = 'Y'
+                        sustainability_q6_item = item['itemId']
+                    elif item['title'] == master_question["7"]:
+                        sustainability_q7_flag = 'Y'
+                        sustainability_q7_item = item['itemId']
+                    elif item['title'] == master_question["8"]:
+                        sustainability_q8_flag = 'Y'
+                        sustainability_q8_item = item['itemId']
+                    elif item['title'] == master_question["9"]:
+                        sustainability_q9_flag = 'Y'
+                        sustainability_q9_item = item['itemId']
+                    elif item['title'] == master_question["10"]:
+                        sustainability_q10_flag = 'Y'
+                        sustainability_q10_item = item['itemId']
+                    elif item['title'] == master_question["11"]:
+                        sustainability_q11_flag = 'Y'
+                        sustainability_q11_item = item['itemId']
+                    elif item['title'] == master_question["12"]:
+                        sustainability_q12_flag = 'Y'
+                        sustainability_q12_item = item['itemId']
+                    elif item['title'] == master_question["13"]:
+                        sustainability_q13_flag = 'Y'
+                        sustainability_q13_item = item['itemId']
+                    elif item['title'] == master_question["14"]:
+                        sustainability_q14_flag = 'Y'
+                        sustainability_q14_item = item['itemId']
+                    elif item['title'] == master_question["15"]:
+                        sustainability_q15_flag = 'Y'
+                        sustainability_q15_item = item['itemId']
+                    elif item['title'] == master_question["16"]:
+                        sustainability_q16_flag = 'Y'
+                        sustainability_q16_item = item['itemId']
+                    else:
+                        print("Question is not in the master list")
+                result = (internal_id + '|' + parent_item_id + '|' +
+                          'Q1:' + sustainability_q1_flag + ',I1:' + sustainability_q1_item + '|' +
+                          'Q2:' + sustainability_q2_flag + ',I2:' + sustainability_q2_item + '|' +
+                          'Q3:' + sustainability_q3_flag + ',I3:' + sustainability_q3_item + '|' +
+                          'Q4:' + sustainability_q4_flag + ',I4:' + sustainability_q4_item + '|' +
+                          'Q5:' + sustainability_q5_flag + ',I5:' + sustainability_q5_item + '|' +
+                          'Q6:' + sustainability_q6_flag + ',I6:' + sustainability_q6_item + '|' +
+                          'Q7:' + sustainability_q7_flag + ',I7:' + sustainability_q7_item + '|' +
+                          'Q8:' + sustainability_q8_flag + ',I8:' + sustainability_q8_item + '|' +
+                          'Q9:' + sustainability_q9_flag + ',I9:' + sustainability_q9_item + '|' +
+                          'Q10:' + sustainability_q10_flag + ',I10:' + sustainability_q10_item + '|' +
+                          'Q11:' + sustainability_q11_flag + ',I11:' + sustainability_q11_item + '|' +
+                          'Q12:' + sustainability_q12_flag + ',I12:' + sustainability_q12_item + '|' +
+                          'Q13:' + sustainability_q13_flag + ',I13:' + sustainability_q13_item + '|' +
+                          'Q14:' + sustainability_q14_flag + ',I14:' + sustainability_q14_item + '|' +
+                          'Q15:' + sustainability_q15_flag + ',I15:' + sustainability_q15_item + '|' +
+                          'Q16:' + sustainability_q16_flag + ',I16:' + sustainability_q16_item)
+
+                results.append(result)
+
+            else:
+                print(f"No Sustainability item found for InternalId {internal_id}")
+        except Exception as error:
+            print(f"Required attributes not found in the JSON response for {internal_id}:", error)
+    return results
+
+
+def generate_ariba_response_item_res(internal_id, loop_counter, check_value):
+    """"
+    Generate the Ariba item reponse, need to pass event id as input
+    """
+    realm = 'syngenta'
+    headers = get_headers()
+    try:
+        url = f"https://eu.openapi.ariba.com/api/sourcing-approval/v2/prod/RFXDocument/{internal_id}?realm={realm}&$select=itemResponses"
+        if loop_counter == check_value:
+            headers = get_headers()
+
+        item_response = requests.get(url, headers=headers)
+        response_data = item_response.json()
+        log.info(response_data)
+        if item_response.status_code == 200:
+            log.info(f"Response received for Ariba item for internal id {internal_id}")
+        else:
+            raise api_response_400(f"Error code 400 received for item response for internal id {internal_id}")
+    except api_response_400 as e:
+        log.error(f'Received error when calling ariba API : {str(e)}')
+        raise e
+    return response_data
+
+
+# def find_item_response(data, item_id):
+#     for item_response in data['itemResponses']:
+#         if item_response['item']['itemId'] == item_id:
+#             for term in item_response['item']['terms']:
+#                 if 'value' in term:
+#                     return term['value']
+#     return "N/A"
+
+def find_item_response(data, item_id):
+    responses = []
+    for item_response in data['itemResponses']:
+        if item_response['item']['itemId'] == item_id:
+            supplier_info = f"{item_response['supplierUniqueName']}:{item_response['orgSystemId']}"
+            for term in item_response['item']['terms']:
+                if 'value' in term:
+                    responses.append(f"{supplier_info}:{term['value']}")
+    return '^'.join(responses) if responses else "N/A"
+
+
+def generate_ariba_total_item_response(bucket_name,s3_key):
+    output_results = []
+
+    # Variables to control the API rate limit
+    loop_counter = 1
+    check_value = 30
+
+        # Read the question_id_list.txt file from S3
+    file_content = read_file_from_s3(bucket_name, s3_key)
+    
+    if file_content is None:
+        print("Failed to read question_id_list.txt from S3.")
+        return output_results
+
+    for line in file_content.splitlines():
+        line = line.strip()
+        question_data = line.split('|')
+
+        internalId = question_data[0]
+        parent_item_id = question_data[1]
+        questions = question_data[2:]
+
+        data = generate_ariba_response_item_res(internalId, loop_counter, check_value)
+
+        # Process questions and get responses
+        responses = []
+        for question in questions:
+            question_id = question.split(':')[-1]
+            response = find_item_response(data, question_id)
+            responses.append(response)
+        print(f"Generating response for internalId {internalId}")
+        # Create the output string
+        output_parts = [internalId]
+        for i, response in enumerate(responses, 1):
+            final_response = str(response).replace('\n', '')
+            output_parts.append(f"Question {i} : {final_response}")
+
+        output_string = '|'.join(output_parts)
+        output_results.append(output_string)
+        print(output_string)
+
+        loop_counter = loop_counter + 1
+        if loop_counter == check_value:
+            check_value = check_value + 30
+
+    return output_results
+
+def write_ariba_response_item_to_s3(item_response, bucket_name, s3_key):
+    """
+    This function writes the Ariba response item as JSON to an S3 bucket.
+    :param dict item_response: The Ariba response item to be written
+    :param str bucket_name: Name of the S3 bucket
+    :param str s3_key: S3 object key (path and filename in the bucket)
+    """
+    # Create an S3 client
+    s3_client = boto3.client('s3')
+
+    try:
+        # Convert the item_response to a JSON string
+        json_data = json.dumps(item_response, indent=4)
+
+        # Upload the JSON string to S3
+        s3_client.put_object(
+            Bucket=bucket_name,
+            Key=s3_key,
+            Body=json_data,
+            ContentType='application/json'
+        )
+        print(f"Successfully wrote Ariba response to '{s3_key}' in bucket '{bucket_name}'.")
+    
+    except ClientError as e:
+        print(f"Error occurred while writing to S3: {e}")
+    except TypeError as e:
+        print(f"Error in JSON serialization: {e}")
+
+
+def write_string_to_s3(long_string, bucket_name, s3_key):
+    """
+    This function takes a list of strings and writes them to a file in an S3 bucket.
+    :param list long_string: List of strings to write
+    :param str bucket_name: Name of the S3 bucket
+    :param str s3_key: S3 object key (path and filename in the bucket)
+    """
+    s3_client = boto3.client('s3')
+    # Join the lines with newline characters
+    content = '\n'.join(long_string)
+
+    # Create a file-like object in memory
+    file_obj = io.BytesIO(content.encode('utf-8'))
+
+    try:
+        # Upload the file to S3
+        s3_client.upload_fileobj(file_obj, bucket_name, s3_key)
+        print(f"File '{s3_key}' has been created in bucket '{bucket_name}' with the content.")
+    except ClientError as e:
+        print(f"An error occurred while writing to S3: {e}")
+
+
+def delete_file_from_s3_if_exists(bucket_name, s3_key):
+    """
+    This function checks if a file exists in an S3 bucket and deletes it if it does.
+    :param str bucket_name: Name of the S3 bucket
+    :param str s3_key: S3 object key (path and filename in the bucket)
+    """
+    # Create an S3 client
+    s3_client = boto3.client('s3')
+
+    try:
+        # Check if the file exists
+        s3_client.head_object(Bucket=bucket_name, Key=s3_key)
+        
+        # If we reach this point, the file exists. Delete it.
+        s3_client.delete_object(Bucket=bucket_name, Key=s3_key)
+        print(f"File '{s3_key}' has been deleted successfully from bucket '{bucket_name}'.")
+    
+    except ClientError as e:
+        if e.response['Error']['Code'] == '404':
+            # The file does not exist
+            print(f"File '{s3_key}' does not exist in bucket '{bucket_name}'.")
+        elif e.response['Error']['Code'] == '403':
+            # Permission denied
+            print(f"Permission denied: Unable to delete '{s3_key}' from bucket '{bucket_name}'. Check if you have the necessary permissions.")
+        else:
+            # Some other error occurred
+            print(f"Error occurred while trying to delete '{s3_key}' from bucket '{bucket_name}': {e}")
+
+def read_json_from_s3(bucket_name, s3_key):
+    """
+    Read a JSON file from an S3 bucket.
+    :param str bucket_name: Name of the S3 bucket
+    :param str s3_key: S3 object key (path and filename in the bucket)
+    :return: Parsed JSON data
+    """
+    s3_client = boto3.client('s3')
+    try:
+        response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+        json_content = response['Body'].read().decode('utf-8')
+        return json.loads(json_content)
+    except ClientError as e:
+        print(f"Error reading file from S3: {e}")
+        return None
+
+def read_file_from_s3(bucket_name, s3_key):
+    """
+    Read a file from an S3 bucket.
+    :param str bucket_name: Name of the S3 bucket
+    :param str s3_key: S3 object key (path and filename in the bucket)
+    :return: File content as a string
+    """
+    s3_client = boto3.client('s3')
+    try:
+        response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+        return response['Body'].read().decode('utf-8')
+    except ClientError as e:
+        print(f"Error reading file from S3: {e}")
+        return None
+    
+#Glue job invocation
+def invoke_gluejob(job_name):
+    glue = boto3.client(service_name='glue', region_name=region_name,endpoint_url='https://glue.eu-central-1.amazonaws.com', verify=False)
+    my_job = glue.start_job_run(JobName=job_name)
+    print('job details..', my_job)
+    status = glue.get_job_run(JobName=job_name, RunId=my_job['JobRunId'])
+    print('job status.. ', status)
+
+
+if __name__ == "__main__":
+    start_time = datetime.now()
+    # Example usage
+    log = get_logger("events_sustainable_questions")
+
+    env = get_job_parameter('env')
+    s3_env = env.upper()
+    TOPIC_ARN = get_job_parameter('topic_arn')
+    region_name = get_job_parameter('region_name')
+    INGESTION_BUCKET = get_job_parameter('ingestion_bucket')
+    method = get_job_parameter('method')
+    s3_path = env.upper() + '/ingestion/ARIBA/' 
+    #method = 'FULL'
+    delta_in_days = 15
+
+    load_glue_job = 'mio226_projects_ariba_sustainable_questions_load' + "_" + env
+
+    years = [2023]
+    if method == 'FULL':
+        full_response = []
+        current_month_end_date = get_current_month_end_date()
+        for year in years:
+            for month in range(7, 13):
+                # get data for every month
+                month_start_date = f"{year}-{month:02}-01"
+                month_end_date = get_month_end_date(month, year)
+                if month_end_date > current_month_end_date:
+                    break
+                print(month_start_date, month_end_date)
+                event_list = query_redshift_event_ids(month_start_date, month_end_date)
+                item_response = generate_ariba_response_item(event_list)
+                full_response += item_response
+
+        # Write Ariba item response into a file named ariba_sustainable_items.json
+        output_filename = s3_path + 'Sustainable_Items/ariba_sustainable_items.json'
+        delete_file_from_s3_if_exists(INGESTION_BUCKET, output_filename)
+        write_ariba_response_item_to_s3(full_response, INGESTION_BUCKET, output_filename)
+
+        # Load the JSON data
+        json_data = read_json_from_s3(INGESTION_BUCKET, output_filename)
+        
+        # Process the data
+        output = process_json(json_data)
+
+        # Write the document id and question id into a .txt file where Sustainability section is found
+        item_list_filename = s3_path + 'Item_List/question_id_list.txt'
+        delete_file_from_s3_if_exists(INGESTION_BUCKET, item_list_filename)
+        write_string_to_s3(output, INGESTION_BUCKET, item_list_filename)
+
+        # Fetch the Sustainable question details form Ariba API and write into a file, check if the file exist before writing it to the file
+        final_result = generate_ariba_total_item_response(INGESTION_BUCKET, item_list_filename)
+        final_list_filename = s3_path + 'Final_List_WRes/sustainable_item_response_with_answers.txt'
+        delete_file_from_s3_if_exists(INGESTION_BUCKET, final_list_filename)
+        write_string_to_s3(final_result, INGESTION_BUCKET, final_list_filename)
+
+        invoke_gluejob(load_glue_job)
+
+    else:
+        delta_start_date = (
+                datetime.today() - timedelta(days=delta_in_days)).strftime('%Y-%m-%d')
+        delta_end_date = (datetime.today()).strftime('%Y-%m-%d')
+        #event_list = query_redshift_event_ids(delta_start_date, delta_end_date)
+        event_list = ['Doc2240568047', 'Doc2205943093', 'Doc2112471559', 'Doc2240568047', 'Doc2234150698']
+        item_response = generate_ariba_response_item(event_list)
+
+        # Write Ariba item response into a file named ariba_sustainable_items.json
+        output_filename = s3_path + 'Sustainable_Items/ariba_sustainable_items.json'
+        delete_file_from_s3_if_exists(INGESTION_BUCKET, output_filename)
+        write_ariba_response_item_to_s3(item_response, INGESTION_BUCKET, output_filename)
+
+        # Load the JSON data
+        json_data = read_json_from_s3(INGESTION_BUCKET, output_filename)
+        
+        # Process the data
+        output = process_json(json_data)
+
+        # Write the document id and question id into a .txt file where Sustainability section is found
+        item_list_filename = s3_path + 'Item_List/question_id_list.txt'
+        delete_file_from_s3_if_exists(INGESTION_BUCKET, item_list_filename)
+        write_string_to_s3(output, INGESTION_BUCKET, item_list_filename)
+
+        # Fetch the Sustainable question details form Ariba API and write into a file, check if the file exist before writing it to the file
+        final_result = generate_ariba_total_item_response(INGESTION_BUCKET, item_list_filename)
+        final_list_filename = s3_path + 'Final_List_WRes/sustainable_item_response_with_answers.txt'
+        delete_file_from_s3_if_exists(INGESTION_BUCKET, final_list_filename)
+        write_string_to_s3(final_result, INGESTION_BUCKET, final_list_filename)
+
+        invoke_gluejob(load_glue_job)
